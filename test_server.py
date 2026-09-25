@@ -52,6 +52,14 @@ class BridgeTests(unittest.TestCase):
                 server.create_draft(['x@example.com\nBcc:evil@example.com'], 'test', 'body')
             run.assert_not_called()
 
+class SearchTests(unittest.TestCase):
+    def test_scan_time_budget_is_below_the_bridge_timeout(self):
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, OK, '')) as run:
+            server.search_messages('acct-1', ['INBOX'])
+            self.assertEqual(payload_of(run)['time_budget_ms'], server.SEARCH_BUDGET_MS)
+            self.assertLess(server.SEARCH_BUDGET_MS, run.call_args.kwargs['timeout'] * 1000)
+
 class AllowlistTests(unittest.TestCase):
     def run_with_env(self, value):
         env = {k: v for k, v in os.environ.items() if k != 'APPLE_MAIL_ACCOUNTS'}

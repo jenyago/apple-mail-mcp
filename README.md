@@ -16,7 +16,8 @@ scripting dictionary. No email credentials or remote server required.
   **Off by default** — see Configuration.
 
 Use account IDs and mailbox path arrays returned by the listing tools. Search
-scans at most 200 messages by default, in Mail's native order. Follow
+scans at most 200 messages by default (up to 1,000), in Mail's native order, and
+stops after about 30 seconds on a slow mailbox. Follow
 `next_offset` until null, including on empty pages. Results are not guaranteed
 newest-first. Mailbox changes between pages can cause skips or duplicates.
 Account-scoped mailboxes only; local “On My Mac” mailboxes and attachment downloads
