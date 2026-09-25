@@ -1,3 +1,4 @@
+const started = Date.now();
 const mail = Application('com.apple.mail');
 const meta = {};
 // p.allowed_emails is null (every account) or a lowercase address allowlist. Every
@@ -45,16 +46,33 @@ function execute() {
         return out;
     }
     if (p.op === 'search') {
-        const box = mailbox(), total = box.messages.length;
+        // One bulk id() call, then access by id. Indexing box.messages[i] costs time proportional
+        // to the mailbox size on every access (~190 ms/property on a 5,000-message Gmail inbox,
+        // so a 200-message scan exceeded the timeout); byId is ~8 ms/property.
+        const box = mailbox(), ids = box.messages.id(), total = ids.length;
         const end = Math.min(total, p.offset + p.scan_limit), results = [];
         const query = p.query.toLowerCase();
-        let i = p.offset;
+        let i = p.offset, tried = 0, unreadable = 0, lastError = '';
         for (; i < end && results.length < p.limit; i++) {
-            const m = box.messages[i];
-            if (p.unread_only && m.readStatus()) continue;
-            if (query && !(m.subject() + '\n' + m.sender()).toLowerCase().includes(query)) continue;
-            results.push(summary(m));
+            // Stop before the caller's timeout kills osascript: Mail keeps working on abandoned
+            // requests, which makes the next calls time out too. next_offset resumes the scan.
+            // Always scan at least one message so next_offset advances.
+            if (i > p.offset && Date.now() - started > p.time_budget_ms) break;
+            let entry = null;
+            tried++;
+            try {
+                const m = box.messages.byId(ids[i]);
+                if (p.unread_only && m.readStatus()) continue;
+                if (query && !(m.subject() + '\n' + m.sender()).toLowerCase().includes(query)) continue;
+                entry = summary(m);
+            } catch (e) {
+                unreadable++;  // usually a message deleted since the id snapshot
+                lastError = String(e);
+                continue;
+            }
+            results.push(entry);
         }
+        if (tried > 0 && unreadable === tried) throw Error('No message in the scan window could be read: ' + lastError);
         return {messages:results, total_in_mailbox:total, next_offset:i < total ? i : null,
             search_scope:'Subject and sender, in Mail mailbox order; continue with next_offset.'};
     }

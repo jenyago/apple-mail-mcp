@@ -98,10 +98,17 @@ next_offset: integer | null, search_scope: string}`.
 `MessageSummary` contains `id`, `subject`, `sender`, `date_received` (ISO date
 string), and `read` (boolean). Empty query lists messages. Search examines
 messages in Mail's native mailbox order, which is not guaranteed newest-first.
-It stops at the return limit, scan limit, or end of mailbox. Continue using
-`next_offset`, even when a page has no matches. Null means the scan reached
-the end. Concurrent mailbox changes can cause duplicates or skipped messages;
-pagination does not provide snapshot isolation.
+It stops at the return limit, the scan limit, a 30-second time budget (always after
+at least one message), or the end of mailbox. Continue using `next_offset`, even
+when a page has no matches. Null means the scan reached the end. Concurrent mailbox
+changes can cause duplicates or skipped messages; pagination does not provide
+snapshot isolation.
+
+Implementation note: the bridge takes all message IDs in one call, then reads
+properties by ID. Positional access (`messages[i]`) costs time proportional to the
+mailbox size on every access; it made a 200-message scan exceed the bridge timeout on
+Gmail inboxes of a few thousand messages. A timed-out call does not cancel work already
+queued in Mail, so later calls can time out until Mail catches up.
 
 ### read_message
 
@@ -180,13 +187,16 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
 | Allowlist parsing fails closed; callers cannot override it | Passed: unit tests |
 | Draft sender outside the allowlist, or empty, is refused before Mail creates anything | Passed: one-off live probe with a non-matching allowlist (not automated) |
 | Audit log records allowed and blocked calls, never message content | Passed: unit tests; live log check |
-| Draft creates, saves, and preserves recipient/body values | Pending live test |
+| Draft creates, saves, and preserves recipient/body values, and is not sent | Passed: one-off live test (2026-09-25) to the account's own address with an allowed sender; test draft removed (not automated) |
+| Search by ID returns the same messages in the same order as positional access | Passed: one-off comparison on a 100- and a 1,438-message inbox at two offsets (not automated) |
+| Worst-case search (unread-only, no-match query, 1,000-message scan) completes within the bridge timeout on every INBOX | Passed: `check_connection.py --live`. Measured 2026-09-25 on 11 accounts, largest inbox 11,596 messages: default scan 4-6 s, worst case 16-27 s |
+| An exhausted time budget still advances `next_offset` | Passed: one-off live probe with a zero budget (not automated) |
 | Isolated client session exposes only this server's tools | Passed: one-off headless `claude --restricted --strict-mcp-config --tools ""` tool listing (not automated) |
 
 Live checks omitted account details and email content from their output. No
-email was sent. Existing tests do not establish full draft behavior, large
-mailbox performance, pagination under concurrent changes, or behavior across
-all account providers.
+email was sent. Existing tests do not establish pagination under concurrent
+changes, behavior across all account providers, or mailboxes larger than the
+11,596-message inbox measured above.
 
 ## Installation and operation
 
@@ -205,8 +215,9 @@ session to load newly registered tools.
 
 ## Follow-up work
 
-1. Live-test draft creation with an explicitly designated test recipient and
-   verify saved subject, body, sender, and recipients without sending.
+1. Automate the one-off live draft test (a designated test recipient, verify the
+   saved draft, remove it) if a safe cleanup path can be found; Mail's move to Trash
+   leaves a copy that needs purging.
 2. Add automated JXA behavior tests for pagination, nested paths, and draft
    partial failures.
 3. Consider local mailbox support, date filters, attachments, and draft updates
