@@ -1,7 +1,19 @@
 const mail = Application('com.apple.mail');
+const meta = {};
+// p.allowed_emails is null (every account) or a lowercase address allowlist. Every
+// account access below goes through permitted(), so this is the single enforcement point.
+function permitted(a) {
+    return !p.allowed_emails || a.emailAddresses().some(e => p.allowed_emails.includes(String(e).toLowerCase()));
+}
+function addressOf(s) {
+    const m = /<([^<>]+)>\s*$/.exec(s);
+    return (m ? m[1] : s).trim().toLowerCase();
+}
 function account(id) {
     const matches = mail.accounts().filter(a => a.id() === id);
     if (matches.length !== 1) throw Error('Account not found; use list_accounts.');
+    if (!permitted(matches[0])) throw Error('Account not permitted by APPLE_MAIL_ACCOUNTS.');
+    meta.account = matches[0].emailAddresses()[0] || null;
     return matches[0];
 }
 function mailbox() {
@@ -18,7 +30,7 @@ function summary(m) {
         date_received: m.dateReceived().toISOString(), read: m.readStatus()};
 }
 function execute() {
-    if (p.op === 'accounts') return mail.accounts().map(a => ({id:a.id(), name:a.name(), email_addresses:a.emailAddresses()}));
+    if (p.op === 'accounts') return mail.accounts().filter(permitted).map(a => ({id:a.id(), name:a.name(), email_addresses:a.emailAddresses()}));
     if (p.op === 'mailboxes') {
         const out = [];
         function walk(parent, path) {
@@ -56,6 +68,10 @@ function execute() {
         return result;
     }
     if (p.op === 'draft') {
+        // Mail files a draft under the sender's account, or its default account when
+        // sender is empty, so an allowlist requires an explicit allowed sender.
+        if (p.allowed_emails && !p.allowed_emails.includes(addressOf(p.sender || '')))
+            throw Error('Sender must be an address listed in APPLE_MAIL_ACCOUNTS.');
         const props = {subject:p.subject, content:p.body, visible:true};
         if (p.sender) props.sender = p.sender;
         const draft = mail.OutgoingMessage(props);
@@ -66,4 +82,4 @@ function execute() {
     }
     throw Error('Unknown operation');
 }
-JSON.stringify(execute());
+JSON.stringify({result: execute(), meta: meta});

@@ -2,7 +2,7 @@
 
 Version: 0.1.0
 
-Status: implemented locally; read access verified; live draft verification pending
+Status: implemented locally; read access and account allowlist verified live; live draft verification pending
 
 Verification date: 2026-09-25
 
@@ -16,7 +16,8 @@ OAuth credentials, or a hosted service.
 ## Scope
 
 Implemented: account discovery, recursive account mailbox discovery, bounded
-subject/sender search, message reading, and visible saved draft creation.
+subject/sender search, message reading, and (opt-in) visible saved draft creation.
+Cross-cutting: an account allowlist, read-only-by-default operation, and an audit log.
 
 Excluded from this version: sending, deleting, archiving, moving, marking read,
 attachments, body search, cross-mailbox search, local “On My Mac” mailboxes,
@@ -29,7 +30,7 @@ is exposed.
   launching application.
 - Python 3.11+; official MCP Python SDK 1.x (`mcp>=1.20,<2`). The checked-in
   `uv.lock` resolves the installed dependencies reproducibly.
-- Codex starts `server.py` through the project's virtual environment.
+- An MCP client starts `server.py` through the project's virtual environment.
 - Transport: MCP over stdin/stdout. Protocol logging goes to stderr.
 - `server.py` validates MCP arguments and invokes `/usr/bin/osascript -l
   JavaScript -` with a fixed JXA bridge (`mail.js`).
@@ -37,6 +38,27 @@ is exposed.
 - The bridge addresses `com.apple.mail` using Mail's scripting interface.
 - Arguments are double JSON encoded into the script sent through stdin, not
   interpolated as executable JavaScript or passed through a shell.
+
+## Configuration and access control
+
+| Variable | Behavior |
+| --- | --- |
+| `APPLE_MAIL_ACCOUNTS` | Comma-separated addresses, matched case-insensitively against each account's addresses. Unset: every account. Set: only matching accounts are listed or reachable. Set but empty, or containing an entry without `@`: startup and every call fail closed. |
+| `APPLE_MAIL_ALLOW_DRAFTS` | Exactly `1` registers `create_draft`; any other value leaves the server read-only. |
+| `APPLE_MAIL_AUDIT_LOG` | Audit log path; default `~/Library/Logs/apple-mail-mcp/audit.log`. |
+
+The allowlist is passed to the JXA bridge as JSON data by `call_mail`, after and
+overriding any caller-supplied value, and enforced in one place (`mail.js`): account
+lookup refuses non-permitted accounts and `accounts` filters them out. `create_draft`
+additionally requires a `sender` that is a listed address, because Mail files a draft
+under its default account when sender is empty. `python server.py --list-accounts`
+prints every account for setup and is not an MCP tool.
+
+Each call appends one JSON line (directory `0700`, file `0600`): timestamp, operation,
+account ID, permitted account address, mailbox path, message ID, result count, and
+outcome (`ok`, or `timeout`, `automation_denied`, `blocked_by_allowlist`, `failed`).
+Subjects, senders, bodies, search text, and draft content are never logged. A log write
+failure is reported on stderr and does not fail the tool call.
 
 ## Tool contracts
 
@@ -48,7 +70,8 @@ Tools return MCP tool results containing the following logical payloads.
 
 Input: none.
 
-Output: array of `{id: string, name: string, email_addresses: string[]}`.
+Output: array of `{id: string, name: string, email_addresses: string[]}`, limited to
+permitted accounts.
 
 ### list_mailboxes
 
@@ -97,6 +120,9 @@ The server does not explicitly change read status.
 
 ### create_draft
 
+Registered only when `APPLE_MAIL_ALLOW_DRAFTS=1`. When `APPLE_MAIL_ACCOUNTS` is set,
+`sender` is required and its address must be listed.
+
 Required: `to: string[]` (1–100 recipients), `subject: string`, `body: string`.
 Optional: `sender: string`, default empty (Mail's default sender).
 
@@ -115,8 +141,8 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
 ## Errors and trust boundaries
 
 - Invalid MCP argument bounds fail before invoking Mail.
-- Missing accounts, ambiguous or missing mailbox names, and missing messages
-  return tool errors.
+- Missing accounts, accounts outside the allowlist, ambiguous or missing mailbox
+  names, and missing messages return tool errors.
 - Automation denial (`-1743`) explains where to enable Mail access in System
   Settings → Privacy & Security → Automation.
 - Timeout returns an error and warns that a draft may have partially completed.
@@ -128,13 +154,19 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
   calling client and may be retained according to that client's settings.
 - Read tools are annotated read-only; draft creation is annotated as a write,
   non-destructive, non-idempotent operation with possible external effects.
+- The server cannot prevent prompt injection through email content. It bounds its own
+  reach (allowlist, read-only default, audit log); the surrounding session's other
+  tools and permissions decide what an injected instruction can do. macOS Automation
+  consent belongs to the launching app, so processes started from that app can script
+  Mail directly; run the server in an isolated client session (see README).
 
 ## Acceptance criteria and verification
 
 | Criterion | Evidence/status |
 | --- | --- |
-| Codex has an enabled apple-mail stdio entry | Passed: `codex mcp get apple-mail` |
-| MCP initializes and discovers exactly five tools | Passed: protocol smoke test |
+| A Claude Code client lists the server as connected | Passed: `claude mcp get apple-mail` (2026-09-25) |
+| MCP initializes and discovers exactly four read-only tools by default | Passed: protocol smoke test |
+| `create_draft` is registered only with `APPLE_MAIL_ALLOW_DRAFTS=1` | Passed: unit test and protocol smoke test |
 | Invalid search limit is rejected | Passed: protocol smoke test |
 | User strings remain inert JSON data | Passed: unit test with injection-shaped text |
 | Automation denial and timeout produce useful errors | Passed: mocked unit tests |
@@ -143,8 +175,13 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
 | Live nested mailbox listing works | Passed during initial implementation |
 | Live bounded message search/listing works | Passed during initial implementation |
 | Live message reading and body truncation work | Passed during initial implementation |
+| Allowlist filters `list_accounts` and blocks other accounts in real Mail | Passed: `check_connection.py --live` |
+| An allowlist matching no account hides every account | Passed: `check_connection.py --live` |
+| Allowlist parsing fails closed; callers cannot override it | Passed: unit tests |
+| Draft sender outside the allowlist, or empty, is refused before Mail creates anything | Passed: one-off live probe with a non-matching allowlist (not automated) |
+| Audit log records allowed and blocked calls, never message content | Passed: unit tests; live log check |
 | Draft creates, saves, and preserves recipient/body values | Pending live test |
-| Tools appear in this existing Codex task | Not loaded in current tool inventory |
+| Isolated client session exposes only this server's tools | Passed: one-off headless `claude --restricted --strict-mcp-config --tools ""` tool listing (not automated) |
 
 Live checks omitted account details and email content from their output. No
 email was sent. Existing tests do not establish full draft behavior, large
@@ -161,10 +198,10 @@ uv run python -m unittest -v
 uv run python check_connection.py --live
 ```
 
-The `apple-mail` entry is already registered in `~/.codex/config.toml`
-and points to this project's `.venv/bin/python` and `server.py` using absolute
-paths. Moving the project requires updating that entry. Use a new Codex task
-or restart the app to load the newly registered tools if necessary.
+Client registration points at this project's `.venv/bin/python` and `server.py` using
+absolute paths; moving the project requires updating it. See the README for the
+recommended isolated Claude Code session and per-client entries. Start a new client
+session to load newly registered tools.
 
 ## Follow-up work
 
