@@ -160,3 +160,7 @@ tests check initialization, tool discovery, and parameter bounds.
 
 Verify the optional draft in Mail. No send tool is exposed. Message order is
 Mail's native order, not guaranteed newest-first.
+
+## License
+
+[MIT](LICENSE)
