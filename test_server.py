@@ -7,7 +7,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 import server
 
 OK = '{"result":{},"meta":{}}'
@@ -59,6 +59,95 @@ class SearchTests(unittest.TestCase):
             server.search_messages('acct-1', ['INBOX'])
             self.assertEqual(payload_of(run)['time_budget_ms'], server.SEARCH_BUDGET_MS)
             self.assertLess(server.SEARCH_BUDGET_MS, run.call_args.kwargs['timeout'] * 1000)
+
+def done(result, meta=None):
+    return subprocess.CompletedProcess([], 0, json.dumps({'result': result, 'meta': meta or {}}), '')
+
+def accounts_result(*emails):
+    return [{'id': f'acct-{i}', 'name': f'Account {i}', 'email_addresses': [e]} for i, e in enumerate(emails, 1)]
+
+def inbox_result(count=1, next_offset=None):
+    return {'messages': [{'id': n, 'subject': 'SECRET-SUBJECT', 'sender': 'SECRET-SENDER',
+                          'date_received': '2026-09-26T00:00:00.000Z', 'read': False} for n in range(1, count + 1)],
+            'total_in_mailbox': 500, 'next_offset': next_offset, 'mailbox_path': ['INBOX'],
+            'search_scope': 'Subject and sender, in Mail mailbox order; continue with next_offset.'}
+
+def payload_from(call):
+    literal = call.kwargs['input'].split('JSON.parse(', 1)[1].split(');\n', 1)[0]
+    return json.loads(json.loads(literal))
+
+class SearchInboxesTests(unittest.TestCase):
+    def test_each_account_is_searched_in_its_own_bridge_call(self):
+        outputs = [done(accounts_result('a@x.com', 'b@y.org')), done(inbox_result(2), {'account': 'a@x.com'}),
+                   done(inbox_result(1), {'account': 'b@y.org'})]
+        with patch.object(server, 'audit'), patch.object(server.subprocess, 'run', side_effect=outputs) as run:
+            result = server.search_inboxes(query='invoice', unread_only=True, limit_per_account=7, scan_limit=50)
+        payloads = [payload_from(c) for c in run.call_args_list]
+        self.assertEqual([p['op'] for p in payloads], ['accounts', 'search', 'search'])
+        self.assertEqual([p.get('account_id') for p in payloads[1:]], ['acct-1', 'acct-2'])
+        for p in payloads[1:]:
+            self.assertEqual((p['inbox'], p['query'], p['unread_only'], p['limit'], p['scan_limit'], p['offset']),
+                             (True, 'invoice', True, 7, 50, 0))
+        self.assertEqual([(a['account_id'], a['email'], len(a['messages'])) for a in result['accounts']],
+                         [('acct-1', 'a@x.com', 2), ('acct-2', 'b@y.org', 1)])
+        self.assertEqual(result['accounts'][0]['mailbox_path'], ['INBOX'])
+        self.assertEqual(result['not_reached'], [])
+
+    def test_one_failing_account_does_not_abort_the_others(self):
+        outputs = [done(accounts_result('a@x.com', 'b@y.org', 'c@z.net')), done(inbox_result(1)),
+                   subprocess.CompletedProcess([], 1, '', 'Error: Mailbox path missing or ambiguous'),
+                   done(inbox_result(3))]
+        with patch.object(server, 'audit'), patch.object(server.subprocess, 'run', side_effect=outputs):
+            result = server.search_inboxes()
+        self.assertEqual(['messages' in a for a in result['accounts']], [True, False, True])
+        self.assertIn('Mailbox path missing', result['accounts'][1]['error'])
+        self.assertEqual(result['accounts'][1]['account_id'], 'acct-2')
+
+    def test_allowlist_applies_to_the_listing_and_every_search(self):
+        outputs = [done(accounts_result('a@x.com')), done(inbox_result())]
+        with patch.dict(os.environ, {'APPLE_MAIL_ACCOUNTS': 'a@x.com'}), patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', side_effect=outputs) as run:
+            server.search_inboxes()
+        self.assertEqual([payload_from(c)['allowed_emails'] for c in run.call_args_list], [['a@x.com']] * 2)
+
+    def test_exhausted_budget_reports_accounts_not_reached_instead_of_running_them(self):
+        clock = {'now': 0.0}
+        outputs = iter([done(accounts_result('a@x.com', 'b@y.org', 'c@z.net')), done(inbox_result(1))])
+        def slow_run(*args, **kwargs):
+            result = next(outputs)
+            if payload_from(call(**kwargs))['op'] == 'search':
+                clock['now'] += server.SEARCH_ALL_BUDGET_MS / 1000 + 1  # the first search uses the whole budget
+            return result
+        with patch.object(server, 'audit'), patch.object(server, 'monotonic', lambda: clock['now']), \
+             patch.object(server.subprocess, 'run', side_effect=slow_run) as run:
+            result = server.search_inboxes()
+        self.assertEqual(run.call_count, 2)  # accounts + the first search only
+        self.assertEqual([a['account_id'] for a in result['accounts']], ['acct-1'])
+        self.assertEqual([a['account_id'] for a in result['not_reached']], ['acct-2', 'acct-3'])
+
+    def test_each_search_gets_a_fair_share_of_the_time_left_capped_below_the_bridge_timeout(self):
+        outputs = [done(accounts_result('a@x.com', 'b@y.org')), done(inbox_result()), done(inbox_result())]
+        with patch.object(server, 'audit'), patch.object(server, 'monotonic', lambda: 0.0), \
+             patch.object(server.subprocess, 'run', side_effect=outputs) as run:
+            server.search_inboxes()
+        budgets = [payload_from(c)['time_budget_ms'] for c in run.call_args_list[1:]]
+        # No time has passed: the first of two accounts gets half, the last gets everything left but never
+        # more than a single-account search would (which is itself below the 45 s bridge timeout).
+        self.assertEqual(budgets, [server.SEARCH_ALL_BUDGET_MS // 2, min(server.SEARCH_ALL_BUDGET_MS, server.SEARCH_BUDGET_MS)])
+
+    def test_audit_has_one_line_per_account_and_never_content(self):
+        outputs = [done(accounts_result('a@x.com', 'b@y.org')), done(inbox_result(2), {'account': 'a@x.com'}),
+                   done(inbox_result(1), {'account': 'b@y.org'})]
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'audit.log'
+            with patch.dict(os.environ, {'APPLE_MAIL_AUDIT_LOG': str(log)}), \
+                 patch.object(server.subprocess, 'run', side_effect=outputs):
+                server.search_inboxes(query='SECRET-QUERY')
+            text = log.read_text()
+        self.assertNotIn('SECRET', text)
+        entries = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual([(e['op'], e['account'], e.get('mailbox'), e['count']) for e in entries[1:]],
+                         [('search', 'a@x.com', 'inbox', 2), ('search', 'b@y.org', 'inbox', 1)])
 
 class AllowlistTests(unittest.TestCase):
     def run_with_env(self, value):
@@ -119,7 +208,7 @@ class DraftGatingTests(unittest.TestCase):
         importlib.reload(server)
 
     def test_read_only_by_default(self):
-        self.assertEqual(self.tool_names(None), {'list_accounts', 'list_mailboxes', 'search_messages', 'read_message'})
+        self.assertEqual(self.tool_names(None), {'list_accounts', 'list_mailboxes', 'search_messages', 'search_inboxes', 'read_message'})
 
     def test_only_exact_one_enables_drafts(self):
         for value in ('0', 'true', 'yes', ''):

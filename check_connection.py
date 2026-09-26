@@ -11,7 +11,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 SERVER = Path(__file__).with_name('server.py')
-READ_TOOLS = {'list_accounts', 'list_mailboxes', 'search_messages', 'read_message'}
+READ_TOOLS = {'list_accounts', 'list_mailboxes', 'search_messages', 'search_inboxes', 'read_message'}
 audit_log = ''
 
 @asynccontextmanager
@@ -42,7 +42,7 @@ async def main():
             assert names == READ_TOOLS, names
             bad = await session.call_tool('search_messages', {'account_id': 'invalid', 'mailbox_path': ['INBOX'], 'limit': 0})
             assert bad.isError, 'Invalid limit was accepted'
-            print('PASS: MCP initialization, four read-only tools, input validation')
+            print('PASS: MCP initialization, five read-only tools, input validation')
         async with client(APPLE_MAIL_ALLOW_DRAFTS='1') as session:
             names = await tool_names(session)
             assert names == READ_TOOLS | {'create_draft'}, names
@@ -93,6 +93,28 @@ async def main():
                 assert not result.isError, f'Search failed on an INBOX: {result.content[0].text[:80]}'
                 slowest, checked = max(slowest, time.monotonic() - start), checked + 1
         print(f'PASS: worst-case INBOX search completed on {checked} account(s); slowest {slowest:.0f}s of the 45s timeout')
+
+        # Cross-account search, worst case: unread-only, no-match, deepest scan, every permitted inbox.
+        # A no-match query returns no message content. Nothing may error, and the whole call stays under a minute.
+        async with client() as session:
+            start = time.monotonic()
+            result = await session.call_tool('search_inboxes', {
+                'query': 'zz-no-such-subject-zz', 'unread_only': True, 'limit_per_account': 50, 'scan_limit': 1000})
+            elapsed = time.monotonic() - start
+            assert not result.isError, f'search_inboxes failed: {result.content[0].text[:80]}'
+            report = json.loads(result.content[0].text)
+            errors = [a['error'][:80] for a in report['accounts'] if 'error' in a]
+            assert not errors, f'search_inboxes had failing accounts: {errors}'
+            assert len(report['accounts']) + len(report['not_reached']) == len(found), 'search_inboxes lost an account'
+            assert elapsed < 60, f'search_inboxes took {elapsed:.0f}s'
+        print(f'PASS: search_inboxes covered {len(report["accounts"])} of {len(found)} account(s) in {elapsed:.0f}s, '
+              f'{len(report["not_reached"])} not reached')
+
+        async with client(APPLE_MAIL_ACCOUNTS=address) as session:
+            result = await session.call_tool('search_inboxes', {'query': 'zz-no-such-subject-zz', 'scan_limit': 1})
+            scoped = {a['account_id'] for a in json.loads(result.content[0].text)['accounts']}
+            assert scoped == expected, 'search_inboxes reached accounts outside the allowlist'
+        print('PASS: search_inboxes stays inside the allowlist')
 
         entries = [json.loads(line) for line in Path(audit_log).read_text().splitlines()]
         assert any(e['ok'] for e in entries) and any(e.get('error') == 'blocked_by_allowlist' for e in entries)

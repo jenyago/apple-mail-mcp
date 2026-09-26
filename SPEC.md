@@ -2,9 +2,9 @@
 
 Version: 0.1.0
 
-Status: implemented locally; read access and account allowlist verified live; live draft verification pending
+Status: implemented locally; read access, account allowlist, cross-account inbox search and (one-off, not automated) draft creation verified live
 
-Verification date: 2026-09-25
+Verification date: 2026-09-26
 
 ## Purpose
 
@@ -16,11 +16,13 @@ OAuth credentials, or a hosted service.
 ## Scope
 
 Implemented: account discovery, recursive account mailbox discovery, bounded
-subject/sender search, message reading, and (opt-in) visible saved draft creation.
+subject/sender search in one mailbox, first-page inbox search across every permitted
+account, message reading, and (opt-in) visible saved draft creation.
 Cross-cutting: an account allowlist, read-only-by-default operation, and an audit log.
 
 Excluded from this version: sending, deleting, archiving, moving, marking read,
-attachments, body search, cross-mailbox search, local “On My Mac” mailboxes,
+attachments, body search, search across mailboxes other than each account's inbox,
+one cursor that pages through several accounts, local “On My Mac” mailboxes,
 CC/BCC, draft editing, and notifications. No arbitrary script execution tool
 is exposed.
 
@@ -54,7 +56,9 @@ additionally requires a `sender` that is a listed address, because Mail files a 
 under its default account when sender is empty. `python server.py --list-accounts`
 prints every account for setup and is not an MCP tool.
 
-Each call appends one JSON line (directory `0700`, file `0600`): timestamp, operation,
+Each bridge call appends one JSON line (directory `0700`, file `0600`), so `search_inboxes`
+writes one line for the account listing and one per account searched (its mailbox is
+recorded as `inbox`): timestamp, operation,
 account ID, permitted account address, mailbox path, message ID, result count, and
 outcome (`ok`, or `timeout`, `automation_denied`, `blocked_by_allowlist`, `failed`).
 Subjects, senders, bodies, search text, and draft content are never logged. A log write
@@ -109,6 +113,35 @@ properties by ID. Positional access (`messages[i]`) costs time proportional to t
 mailbox size on every access; it made a 200-message scan exceed the bridge timeout on
 Gmail inboxes of a few thousand messages. A timed-out call does not cancel work already
 queued in Mail, so later calls can time out until Mail catches up.
+
+### search_inboxes
+
+Searches the inbox of every permitted account and returns the first page from each, so a
+client can review all accounts in one call (for example `unread_only: true`).
+
+| Argument | Type | Default | Constraint |
+| --- | --- | --- | --- |
+| query | string | empty | Case-insensitive subject/sender substring |
+| unread_only | boolean | false | Include only unread messages if true |
+| limit_per_account | integer | 5 | 1–50 returned matches per account |
+| scan_limit | integer | 100 | 1–1,000 messages examined per account |
+
+Output: `{accounts: AccountPage[], not_reached: {account_id, email}[], search_scope: string}`.
+`AccountPage` is `{account_id, email}` plus either the single-account search fields
+(`messages`, `total_in_mailbox`, `next_offset`) and `mailbox_path`, or `error: string`.
+
+- The inbox is the account's top-level mailbox named `inbox`, matched case-insensitively
+  (`INBOX` on most providers, `Inbox` on some). Zero or several matches is that account's `error`.
+- The accounts come from the same allowlist-filtered listing as `list_accounts`.
+- Each account is searched in its own bridge call, in listing order, from offset 0. A failing
+  account (timeout, missing inbox) is reported in its own entry and does not stop the others.
+- Overall budget 40 s (`SEARCH_ALL_BUDGET_MS`). Each search gets an equal share of the time
+  left, capped at the single-account budget of 30 s; its scan stops there and reports
+  `next_offset`. An account not started before the budget is spent is listed in `not_reached`.
+- No cross-account cursor: to go deeper in one account, call `search_messages` with that
+  entry's `account_id`, `mailbox_path` and `next_offset`.
+- Message order is Mail's native order. On the 11 accounts measured on 2026-09-26 it was
+  newest-first on all of them; that remains a property of Mail, not a guarantee of this server.
 
 ### read_message
 
@@ -172,7 +205,7 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
 | Criterion | Evidence/status |
 | --- | --- |
 | A Claude Code client lists the server as connected | Passed: `claude mcp get apple-mail` (2026-09-25) |
-| MCP initializes and discovers exactly four read-only tools by default | Passed: protocol smoke test |
+| MCP initializes and discovers exactly five read-only tools by default | Passed: protocol smoke test |
 | `create_draft` is registered only with `APPLE_MAIL_ALLOW_DRAFTS=1` | Passed: unit test and protocol smoke test |
 | Invalid search limit is rejected | Passed: protocol smoke test |
 | User strings remain inert JSON data | Passed: unit test with injection-shaped text |
@@ -192,6 +225,10 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
 | Worst-case search (unread-only, no-match query, 1,000-message scan) completes within the bridge timeout on every INBOX | Passed: `check_connection.py --live`. Measured 2026-09-25 on 11 accounts, largest inbox 11,596 messages: default scan 4-6 s, worst case 16-27 s |
 | An exhausted time budget still advances `next_offset` | Passed: one-off live probe with a zero budget (not automated) |
 | Isolated client session exposes only this server's tools | Passed: one-off headless `claude --restricted --strict-mcp-config --tools ""` tool listing (not automated) |
+| `search_inboxes` searches each permitted account's inbox in its own call; a failing account does not stop the rest; the allowlist is applied to the listing and every search; an exhausted budget lists the remaining accounts in `not_reached`; the audit log has one content-free line per account | Passed: unit tests (`SearchInboxesTests`) |
+| `search_inboxes` finds every account's inbox, including a differently cased `Inbox` | Passed: `check_connection.py --live` and a headline call (`unread_only`, defaults) on 2026-09-26: 11 of 11 accounts, 0 not reached, 10 s |
+| `search_inboxes` worst case (unread-only, no-match query, 1,000-message scan, 50 per account) completes with no failing account | Passed: `check_connection.py --live`. 11 of 11 accounts, 0 not reached, 39 s of the 40 s budget |
+| `search_inboxes` never reaches an account outside the allowlist | Passed: `check_connection.py --live` |
 
 Live checks omitted account details and email content from their output. No
 email was sent. Existing tests do not establish pagination under concurrent

@@ -11,6 +11,9 @@ scripting dictionary. No email credentials or remote server required.
 - `list_accounts`: permitted account IDs, names, and email addresses.
 - `list_mailboxes`: nested mailbox paths for an account.
 - `search_messages`: paginated, case-insensitive subject/sender search in a mailbox.
+- `search_inboxes`: the same search over the inbox of every permitted account in one call
+  (first page from each; `unread_only: true` reviews what is new). Go deeper in one account
+  with `search_messages` and the `next_offset` it returns.
 - `read_message`: message metadata and bounded plain-text content.
 - `create_draft`: save a visible draft for review in Mail; never sends it.
   **Off by default** — see Configuration.
@@ -143,7 +146,8 @@ uv run python check_connection.py --live
 ```
 
 The live check lists accounts without printing their contents, then proves against real
-Mail that an allowlist filters `list_accounts`, blocks other accounts, and is logged.
+Mail that an allowlist filters `list_accounts`, blocks other accounts, and is logged, and
+that `search_inboxes` reaches every permitted account inside its time budget.
 It does not create drafts or send email. Unit tests cover script injection resistance,
 permission errors, timeouts, recipient validation, allowlist parsing and fail-closed
 behavior, draft gating, and that the audit log never contains message content. Protocol
@@ -155,7 +159,8 @@ tests check initialization, tool discovery, and parameter bounds.
 2. “List the mailboxes for [account].”
 3. “List five messages from its Inbox using apple-mail.”
 4. “Read the first message from that result.”
-5. Optional, with drafts enabled: “Create a draft to [your own email] from [allowed
+5. “Use apple-mail to show my unread messages across all accounts.”
+6. Optional, with drafts enabled: “Create a draft to [your own email] from [allowed
    sender] with subject MCP test and body This is a draft test. Do not send it.”
 
 Verify the optional draft in Mail. No send tool is exposed. Message order is
