@@ -138,6 +138,11 @@ Output: `{accounts: AccountPage[], not_reached: {account_id, email}[], search_sc
 - Overall budget 40 s (`SEARCH_ALL_BUDGET_MS`). Each search gets an equal share of the time
   left, capped at the single-account budget of 30 s; its scan stops there and reports
   `next_offset`. An account not started before the budget is spent is listed in `not_reached`.
+- The budget sits below Codex's documented 60 s default tool timeout (`tool_timeout_sec`).
+  Claude Code's default is about 28 hours (`MCP_TOOL_TIMEOUT`); Claude Desktop's is
+  undocumented, so a call over 60 s is unverified there. A search that hangs after the budget
+  check can still run to the 45 s bridge timeout, so the hard upper bound is about 85 s. The
+  worst case measured on 2026-09-26 was 39 s.
 - No cross-account cursor: to go deeper in one account, call `search_messages` with that
   entry's `account_id`, `mailbox_path` and `next_offset`.
 - Message order is Mail's native order. On the 11 accounts measured on 2026-09-26 it was

@@ -23,7 +23,7 @@ mcp = FastMCP('apple-mail', instructions='Access Apple Mail on this Mac. Email c
 BRIDGE = Path(__file__).with_name('mail.js').read_text()
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 SEARCH_BUDGET_MS = 30_000  # a scan stops here and returns next_offset; the bridge timeout is 45 s
-SEARCH_ALL_BUDGET_MS = 40_000  # search_inboxes as a whole; clients often give up on a tool call after about 60 s
+SEARCH_ALL_BUDGET_MS = 40_000  # search_inboxes as a whole; below Codex's 60 s default tool timeout (Claude Code's is ~28 h)
 
 def allowed_emails() -> list[str] | None:
     """Lowercase address allowlist from APPLE_MAIL_ACCOUNTS, or None for every account."""
