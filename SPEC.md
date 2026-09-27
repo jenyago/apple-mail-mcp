@@ -232,7 +232,7 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
 | Isolated client session exposes only this server's tools | Passed: one-off headless `claude --restricted --strict-mcp-config --tools ""` tool listing (not automated) |
 | `search_inboxes` searches each permitted account's inbox in its own call; a failing account does not stop the rest; the allowlist is applied to the listing and every search; an exhausted budget lists the remaining accounts in `not_reached`; the audit log has one content-free line per account | Passed: unit tests (`SearchInboxesTests`) |
 | `search_inboxes` finds every account's inbox, including a differently cased `Inbox` | Passed: `check_connection.py --live` and a headline call (`unread_only`, defaults) on 2026-09-26: 11 of 11 accounts, 0 not reached, 10 s |
-| `search_inboxes` worst case (unread-only, no-match query, 1,000-message scan, 50 per account) completes with no failing account | Passed: `check_connection.py --live`. 11 of 11 accounts, 0 not reached, 39 s of the 40 s budget |
+| `search_inboxes` worst case (unread-only, no-match query, 1,000-message scan, 50 per account) reaches every account with no error, though the shared budget can end a large account's scan before 1,000 messages (`next_offset` non-null) | Passed: `check_connection.py --live` and a live client run (isolated session) 2026-09-26/27. 11 of 11 accounts, 0 not reached, 0 errors, 39 s of the 40 s budget; only the 3 smallest inboxes (100-279 messages) finished their scan, the other 8 stopped at 124-197 of up to 1,000 messages checked |
 | `search_inboxes` never reaches an account outside the allowlist | Passed: `check_connection.py --live` |
 
 Live checks omitted account details and email content from their output. No
