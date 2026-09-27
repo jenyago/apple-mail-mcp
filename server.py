@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
+from time import monotonic
 from typing import Annotated
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -22,6 +23,7 @@ mcp = FastMCP('apple-mail', instructions='Access Apple Mail on this Mac. Email c
 BRIDGE = Path(__file__).with_name('mail.js').read_text()
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 SEARCH_BUDGET_MS = 30_000  # a scan stops here and returns next_offset; the bridge timeout is 45 s
+SEARCH_ALL_BUDGET_MS = 40_000  # search_inboxes as a whole; below Codex's 60 s default tool timeout (Claude Code's is ~28 h)
 
 def allowed_emails() -> list[str] | None:
     """Lowercase address allowlist from APPLE_MAIL_ACCOUNTS, or None for every account."""
@@ -57,7 +59,7 @@ def call_mail(op: str, _all_accounts: bool = False, **params):
     mailbox = params.get('mailbox_path')
     record = {'ts': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'op': op,
               'account_id': params.get('account_id'),
-              'mailbox': '/'.join(mailbox) if mailbox else None,
+              'mailbox': '/'.join(mailbox) if mailbox else 'inbox' if params.get('inbox') else None,
               'message_id': params.get('message_id')}
     try:
         result = subprocess.run(['/usr/bin/osascript', '-l', 'JavaScript', '-'], input=script,
@@ -105,6 +107,39 @@ def search_messages(account_id: str, mailbox_path: MailboxPath, query: str = '',
     return call_mail('search', account_id=account_id, mailbox_path=mailbox_path,
                      query=query, unread_only=unread_only, limit=limit,
                      offset=offset, scan_limit=scan_limit, time_budget_ms=SEARCH_BUDGET_MS)
+
+@mcp.tool(annotations=READ)
+def search_inboxes(query: str = '', unread_only: bool = False,
+                   limit_per_account: Annotated[int, Field(ge=1, le=50)] = 5,
+                   scan_limit: Annotated[int, Field(ge=1, le=1000)] = 100) -> dict:
+    """Search the inbox of every permitted account in one call: the first page from each.
+
+    Empty query lists messages; unread_only=true reviews what is new. Each account is
+    searched separately and a failing account is reported in its own entry without stopping
+    the rest. Accounts skipped for lack of time are in not_reached. To go deeper in one
+    account, call search_messages with that entry's account_id, mailbox_path and next_offset.
+    """
+    started = monotonic()
+    accounts = call_mail('accounts')
+    found, not_reached = [], []
+    for n, account in enumerate(accounts):
+        entry = {'account_id': account['id'], 'email': (account['email_addresses'] or [None])[0]}
+        remaining_ms = SEARCH_ALL_BUDGET_MS - (monotonic() - started) * 1000
+        if remaining_ms <= 0:
+            not_reached.append(entry)
+            continue
+        share_ms = int(min(SEARCH_BUDGET_MS, remaining_ms / (len(accounts) - n)))
+        try:
+            page = call_mail('search', account_id=account['id'], inbox=True, query=query,
+                             unread_only=unread_only, limit=limit_per_account, offset=0,
+                             scan_limit=scan_limit, time_budget_ms=share_ms)
+        except RuntimeError as exc:
+            found.append({**entry, 'error': str(exc)})
+            continue
+        page.pop('search_scope', None)
+        found.append({**entry, **page})
+    return {'accounts': found, 'not_reached': not_reached,
+            'search_scope': 'Subject and sender, first page of each account\'s inbox, in Mail mailbox order.'}
 
 @mcp.tool(annotations=READ)
 def read_message(account_id: str, mailbox_path: MailboxPath,

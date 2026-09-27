@@ -19,6 +19,12 @@ function account(id) {
 }
 function mailbox() {
     let parent = account(p.account_id);
+    if (p.inbox) {
+        // The inbox is named 'INBOX' on most providers but 'Inbox' on some: match the top level case-insensitively.
+        const inboxes = parent.mailboxes().filter(b => b.name().toLowerCase() === 'inbox');
+        if (inboxes.length !== 1) throw Error('Inbox not found or ambiguous; use list_mailboxes.');
+        return inboxes[0];
+    }
     for (const name of p.mailbox_path) {
         const found = parent.mailboxes().filter(b => b.name() === name);
         if (found.length !== 1) throw Error('Mailbox path missing or ambiguous; use list_mailboxes.');
@@ -74,7 +80,8 @@ function execute() {
         }
         if (tried > 0 && unreadable === tried) throw Error('No message in the scan window could be read: ' + lastError);
         return {messages:results, total_in_mailbox:total, next_offset:i < total ? i : null,
-            search_scope:'Subject and sender, in Mail mailbox order; continue with next_offset.'};
+            search_scope:'Subject and sender, in Mail mailbox order; continue with next_offset.',
+            ...(p.inbox ? {mailbox_path:[box.name()]} : {})};
     }
     if (p.op === 'read') {
         const matches = mailbox().messages.whose({id:p.message_id})();
