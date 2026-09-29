@@ -1,6 +1,6 @@
 [project]
 name = "apple-mail-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local Apple Mail MCP server for macOS"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.20,<2"]

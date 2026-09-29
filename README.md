@@ -11,10 +11,25 @@ scripting dictionary. No email credentials or remote server required.
 - `list_accounts`: permitted account IDs, names, and email addresses.
 - `list_mailboxes`: nested mailbox paths for an account.
 - `search_messages`: paginated, case-insensitive subject/sender search in a mailbox.
-- `search_inboxes`: the same search over the inbox of every permitted account in one call
+  Optional inclusive `since`/`until` ISO-8601 bounds and a case-insensitive recipient
+  address substring narrow the same search.
+- `search_inboxes`: first-page subject/sender search in the inbox of every permitted account in one call
   (first page from each; `unread_only: true` reviews what is new). Go deeper in one account
   with `search_messages` and the `next_offset` it returns.
 - `read_message`: message metadata and bounded plain-text content.
+- `get_thread`: same-mailbox messages linked by RFC `Message-ID`, `References`, and
+  `In-Reply-To`; summaries by default, with bounded optional bodies. Mail exposes no native
+  conversation-membership property through JXA, so results identify the method and whether
+  the bounded mailbox scan was complete. A completed header scan is not a guarantee of
+  Mail UI's subject-based grouping or messages filed in another mailbox. Use
+  `continuation_scan_offset` with the same anchor to retrieve later mailbox windows;
+  combine them client-side because the server retains no cursor state. Optional bodies
+  have a 250,000-character aggregate response cap.
+- `get_statistics`: exact total/unread counts for one explicitly selected account and
+  mailbox. Optional date-window counts are returned only when the bounded scan completes;
+  otherwise the count is unavailable with a reason. No implicit all-account aggregation.
+- `list_attachments`: paginated attachment metadata (name, MIME type, approximate size,
+  downloaded state) for one message. Attachment bytes are **not** retrieved or written.
 - `create_draft`: save a visible draft for review in Mail; never sends it.
   **Off by default** — see Configuration.
 
@@ -24,7 +39,10 @@ stops after about 30 seconds on a slow mailbox. Follow
 `next_offset` until null, including on empty pages. Results are not guaranteed
 newest-first. Mailbox changes between pages can cause skips or duplicates.
 Account-scoped mailboxes only; local “On My Mac” mailboxes and attachment downloads
-are not implemented. No send, delete, move, or arbitrary scripting tool is exposed.
+are not implemented. Date-only search bounds mean whole UTC calendar days; date-time
+bounds must include a timezone. Recipient matching is a case-insensitive substring of
+To/Cc/Bcc addresses. Search order is still Mail's native order, not necessarily newest-first.
+No send, delete, move, or arbitrary scripting tool is exposed.
 
 ## Setup
 
@@ -54,9 +72,13 @@ your terminal, so you can pick addresses for `APPLE_MAIL_ACCOUNTS` without routi
 list through a model. It is a command-line option only, never an MCP tool.
 
 The audit log is one JSON line per call, mode `0600`: time, operation, account, mailbox
-path, message ID, result count, outcome. Blocked attempts are logged with
-`blocked_by_allowlist`. It never contains subjects, senders, bodies, search text, or
+path, message ID, result count, outcome. It never records thread bodies, attachment names,
+attachment bytes, search filters, or file paths. Blocked attempts are logged with
+`blocked_by_allowlist`. It also never contains subjects, senders, message bodies, or
 draft content.
+
+Draft inputs are limited to 100 recipients, a 998-character subject, a 100,000-character
+body, and a 320-character sender value.
 
 ## Security model
 

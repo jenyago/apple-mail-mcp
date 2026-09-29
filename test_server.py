@@ -70,11 +70,175 @@ def inbox_result(count=1, next_offset=None):
     return {'messages': [{'id': n, 'subject': 'SECRET-SUBJECT', 'sender': 'SECRET-SENDER',
                           'date_received': '2026-09-26T00:00:00.000Z', 'read': False} for n in range(1, count + 1)],
             'total_in_mailbox': 500, 'next_offset': next_offset, 'mailbox_path': ['INBOX'],
-            'search_scope': 'Subject and sender, in Mail mailbox order; continue with next_offset.'}
+            'search_scope': 'Subject and sender substring; optional recipient/date filters; in Mail mailbox order.'}
 
 def payload_from(call):
     literal = call.kwargs['input'].split('JSON.parse(', 1)[1].split(');\n', 1)[0]
     return json.loads(json.loads(literal))
+
+
+class NewToolTests(unittest.TestCase):
+    def test_search_date_bounds_are_normalized_and_filters_are_additive(self):
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', return_value=done({})) as run:
+            server.search_messages('acct-1', ['INBOX'], query='invoice',
+                                   since='2026-09-01', until='2026-09-30',
+                                   recipient='person@example.com')
+        payload = payload_of(run)
+        self.assertEqual(payload['query'], 'invoice')
+        self.assertEqual(payload['since'], '2026-09-01T00:00:00.000Z')
+        self.assertEqual(payload['until'], '2026-09-30T23:59:59.999Z')
+        self.assertEqual(payload['recipient'], 'person@example.com')
+        self.assertEqual(payload['scan_limit'], 200)
+
+    def test_malformed_naive_and_inverted_search_dates_fail_before_mail(self):
+        for kwargs in (
+            {'since': 'not-a-date'},
+            {'since': '2026-09-01T12:00:00'},
+            {'since': '2026-09-30', 'until': '2026-09-01'},
+        ):
+            with self.subTest(kwargs=kwargs), patch.object(server.subprocess, 'run') as run:
+                with self.assertRaises(ValueError):
+                    server.search_messages('acct-1', ['INBOX'], **kwargs)
+                run.assert_not_called()
+
+    def test_submillisecond_datetime_bounds_preserve_inclusive_millisecond_precision(self):
+        since, until = server._validated_date_bounds(
+            '2026-09-01T00:00:00.123456+02:00',
+            '2026-09-01T00:00:00.124999+02:00')
+        self.assertEqual(since, '2026-08-31T22:00:00.124Z')
+        self.assertEqual(until, '2026-08-31T22:00:00.124Z')
+
+    def test_statistics_counts_are_explicitly_scoped_and_bounded(self):
+        expected = {'total_count': 2001, 'unread_count': 3,
+                    'date_window': {'count': None, 'complete': False,
+                                    'unavailable_reason': 'Mailbox exceeds the bounded date-count scan limit.'},
+                    'statistics_scope': 'One explicitly selected account and mailbox; total and unread counts are Mail mailbox counts. No cross-account scan.'}
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', return_value=done(expected)) as run:
+            result = server.get_statistics('acct-1', ['Archive'], since='2026-01-01')
+        payload = payload_of(run)
+        self.assertEqual(payload['op'], 'statistics')
+        self.assertEqual(payload['scan_limit'], server.STATISTICS_SCAN_MAX)
+        self.assertEqual(payload['time_budget_ms'], server.STATISTICS_BUDGET_MS)
+        self.assertEqual(payload['allowed_emails'], server.allowed_emails())
+        self.assertIn('No cross-account scan', result['statistics_scope'])
+        self.assertIsNone(result['date_window']['count'])
+
+    def test_thread_uses_allowlisted_mailbox_scope_and_returns_partial_metadata(self):
+        partial = {'messages': [{'id': 9}], 'discovered_count': 1, 'next_offset': None,
+                   'scan_complete': False, 'complete_under_rfc_headers': False,
+                   'partial_reasons': ['scan_limit_reached'],
+                   'continuation_scan_offset': 200,
+                   'native_thread_membership_supported': False}
+        with patch.dict(os.environ, {'APPLE_MAIL_ACCOUNTS': 'allowed@example.com'}), \
+             patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', return_value=done(partial)) as run:
+            result = server.get_thread('acct-1', ['INBOX'], 9, scan_limit=200)
+        payload = payload_of(run)
+        self.assertEqual(payload['allowed_emails'], ['allowed@example.com'])
+        self.assertEqual((payload['op'], payload['account_id'], payload['mailbox_path'],
+                          payload['message_id'], payload['include_bodies']),
+                         ('thread', 'acct-1', ['INBOX'], 9, False))
+        self.assertEqual(result['continuation_scan_offset'], 200)
+        self.assertFalse(result['complete_under_rfc_headers'])
+        self.assertFalse(result['native_thread_membership_supported'])
+
+    def test_thread_body_and_page_bounds_are_passed_to_the_fixed_bridge(self):
+        body = {'messages': [{'id': 9, 'content': 'bounded', 'content_truncated': True}],
+                'discovered_count': 1, 'next_offset': None,
+                'scan_window_complete': True, 'mailbox_scan_finished': True}
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', return_value=done(body)) as run:
+            result = server.get_thread('acct-1', ['INBOX'], 9, include_bodies=True,
+                                       max_chars=500, limit=10, offset=20, scan_limit=30,
+                                       scan_offset=60)
+        payload = payload_of(run)
+        self.assertEqual((payload['include_bodies'], payload['max_chars'],
+                          payload['limit'], payload['offset'], payload['scan_limit'],
+                          payload['scan_offset']),
+                         (True, 500, 10, 20, 30, 60))
+        self.assertTrue(result['messages'][0]['content_truncated'])
+        bridge = Path(server.__file__).with_name('mail.js').read_text()
+        self.assertIn('body.slice(0, p.max_chars)', bridge)
+        self.assertIn('content_truncated = body.length > p.max_chars', bridge)
+        self.assertIn('continuation_scan_offset:nextScanOffset', bridge)
+
+    def test_attachment_listing_is_metadata_only_and_has_no_destination(self):
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run',
+                          return_value=done({'attachments': [], 'total': 0, 'next_offset': None})) as run:
+            server.list_attachments('acct-1', ['INBOX'], 7, limit=25, offset=10)
+        payload = payload_of(run)
+        self.assertEqual(payload['allowed_emails'], server.allowed_emails())
+        self.assertEqual((payload['op'], payload['message_id'], payload['limit'], payload['offset']),
+                         ('attachments', 7, 25, 10))
+        self.assertNotIn('destination', payload)
+        tools = {t.name for t in asyncio.run(server.mcp.list_tools())}
+        self.assertNotIn('download_attachment', tools)
+        self.assertNotIn('download_attachments', tools)
+        bridge = Path(server.__file__).with_name('mail.js').read_text()
+        self.assertNotIn('attachment.save(', bridge)
+
+    def test_new_operations_surface_allowlist_and_timeout_failures(self):
+        denied = subprocess.CompletedProcess([], 1, '', 'Error: Account not permitted by APPLE_MAIL_ACCOUNTS.')
+        with patch.object(server, 'audit') as audit, \
+             patch.object(server.subprocess, 'run', return_value=denied):
+            with self.assertRaisesRegex(RuntimeError, 'operation failed'):
+                server.list_attachments('blocked', ['INBOX'], 4)
+        self.assertEqual(audit.call_args.args[0]['error'], 'blocked_by_allowlist')
+
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', side_effect=subprocess.TimeoutExpired('osascript', 45)):
+            with self.assertRaisesRegex(RuntimeError, 'timed out'):
+                server.get_statistics('acct-1', ['INBOX'])
+
+    def test_allowlist_is_attached_to_each_new_scoped_operation(self):
+        outputs = [done({}) for _ in range(4)]
+        with patch.dict(os.environ, {'APPLE_MAIL_ACCOUNTS': 'allowed@example.com'}), \
+             patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', side_effect=outputs) as run:
+            server.search_messages('acct-1', ['INBOX'])
+            server.get_thread('acct-1', ['INBOX'], 1)
+            server.get_statistics('acct-1', ['INBOX'])
+            server.list_attachments('acct-1', ['INBOX'], 1)
+        self.assertEqual([payload_from(c)['allowed_emails'] for c in run.call_args_list],
+                         [['allowed@example.com']] * 4)
+
+    def test_thread_anchor_without_supported_headers_is_an_explicit_error(self):
+        failure = subprocess.CompletedProcess([], 1, '',
+            'Error: Thread membership is unavailable: anchor has no RFC Message-ID header.')
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', return_value=failure):
+            with self.assertRaisesRegex(RuntimeError, 'no RFC Message-ID'):
+                server.get_thread('acct-1', ['INBOX'], 1)
+
+    def test_audit_for_new_tools_never_records_message_or_attachment_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'audit.log'
+            with patch.dict(os.environ, {'APPLE_MAIL_AUDIT_LOG': str(log)}), \
+                 patch.object(server.subprocess, 'run', side_effect=[
+                     done({'messages': [{'id': 1, 'subject': 'PRIVATE-SUBJECT',
+                                         'sender': 'PRIVATE-SENDER', 'content': 'PRIVATE-BODY'}]}),
+                     done({'attachments': [{'id': 'x', 'name': 'PRIVATE-FILENAME',
+                                            'mime_type': 'application/private'}], 'total': 1})]):
+                server.get_thread('acct-1', ['INBOX'], 1, include_bodies=True)
+                server.list_attachments('acct-1', ['INBOX'], 1)
+            text = log.read_text()
+        self.assertNotIn('PRIVATE', text)
+        entries = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual([(e['op'], e['message_id']) for e in entries],
+                         [('thread', 1), ('attachments', 1)])
+
+    def test_search_reports_partial_unreadable_results(self):
+        partial = {'messages': [], 'partial': True, 'unreadable_count': 2,
+                   'partial_reason': 'One or more messages could not be read; continue with next_offset where available.'}
+        with patch.object(server, 'audit'), \
+             patch.object(server.subprocess, 'run', return_value=done(partial)):
+            result = server.search_messages('acct-1', ['INBOX'], since='2026-09-01')
+        self.assertTrue(result['partial'])
+        self.assertEqual(result['unreadable_count'], 2)
+
 
 class SearchInboxesTests(unittest.TestCase):
     def test_each_account_is_searched_in_its_own_bridge_call(self):
@@ -208,7 +372,9 @@ class DraftGatingTests(unittest.TestCase):
         importlib.reload(server)
 
     def test_read_only_by_default(self):
-        self.assertEqual(self.tool_names(None), {'list_accounts', 'list_mailboxes', 'search_messages', 'search_inboxes', 'read_message'})
+        self.assertEqual(self.tool_names(None), {'list_accounts', 'list_mailboxes', 'search_messages',
+                                                 'search_inboxes', 'read_message', 'get_thread',
+                                                 'get_statistics', 'list_attachments'})
 
     def test_only_exact_one_enables_drafts(self):
         for value in ('0', 'true', 'yes', ''):

@@ -11,7 +11,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 SERVER = Path(__file__).with_name('server.py')
-READ_TOOLS = {'list_accounts', 'list_mailboxes', 'search_messages', 'search_inboxes', 'read_message'}
+READ_TOOLS = {'list_accounts', 'list_mailboxes', 'search_messages', 'search_inboxes',
+              'read_message', 'get_thread', 'get_statistics', 'list_attachments'}
 audit_log = ''
 
 @asynccontextmanager
@@ -24,9 +25,6 @@ async def client(**env):
             await session.initialize()
             yield session
 
-async def tool_names(session):
-    return {t.name for t in (await session.list_tools()).tools}
-
 def listing(result):
     if result.isError:
         raise SystemExit(f'Tool call failed: {result.content}')
@@ -38,14 +36,49 @@ async def main():
     with tempfile.TemporaryDirectory() as tmp:
         audit_log = os.path.join(tmp, 'audit.log')
         async with client() as session:
-            names = await tool_names(session)
+            listed = (await session.list_tools()).tools
+            names = {tool.name for tool in listed}
             assert names == READ_TOOLS, names
+            assert all(tool.annotations and tool.annotations.readOnlyHint for tool in listed), \
+                'A default read tool is not annotated read-only'
+            assert all(tool.annotations and not tool.annotations.destructiveHint
+                       and not tool.annotations.openWorldHint for tool in listed), \
+                'A read tool has an unsafe or inaccurate annotation'
             bad = await session.call_tool('search_messages', {'account_id': 'invalid', 'mailbox_path': ['INBOX'], 'limit': 0})
             assert bad.isError, 'Invalid limit was accepted'
-            print('PASS: MCP initialization, five read-only tools, input validation')
+            bad_date = await session.call_tool('search_messages', {
+                'account_id': 'invalid', 'mailbox_path': ['INBOX'], 'since': 'not-a-date'})
+            assert bad_date.isError, 'Malformed date bound was accepted'
+            inverted_dates = await session.call_tool('search_messages', {
+                'account_id': 'invalid', 'mailbox_path': ['INBOX'],
+                'since': '2026-09-30', 'until': '2026-09-01'})
+            assert inverted_dates.isError, 'Inverted date range was accepted'
+            bad_thread_scan = await session.call_tool('get_thread', {
+                'account_id': 'invalid', 'mailbox_path': ['INBOX'],
+                'message_id': 1, 'scan_limit': 1001})
+            assert bad_thread_scan.isError, 'Out-of-range thread scan limit was accepted'
+            bad_attachment_limit = await session.call_tool('list_attachments', {
+                'account_id': 'invalid', 'mailbox_path': ['INBOX'], 'message_id': 1, 'limit': 101})
+            assert bad_attachment_limit.isError, 'Unbounded attachment metadata page was accepted'
+            bad_mailbox_name = await session.call_tool('list_mailboxes', {
+                'account_id': 'x' * 257})
+            assert bad_mailbox_name.isError, 'Unbounded account ID was accepted'
+            bad_path_segment = await session.call_tool('search_messages', {
+                'account_id': 'invalid', 'mailbox_path': ['x' * 256]})
+            assert bad_path_segment.isError, 'Unbounded mailbox path element was accepted'
+            print('PASS: MCP initialization, eight read-only tools, input validation')
         async with client(APPLE_MAIL_ALLOW_DRAFTS='1') as session:
-            names = await tool_names(session)
+            listed = (await session.list_tools()).tools
+            names = {tool.name for tool in listed}
             assert names == READ_TOOLS | {'create_draft'}, names
+            draft = next(tool for tool in listed if tool.name == 'create_draft')
+            assert draft.annotations and draft.annotations.readOnlyHint is False
+            assert draft.annotations.destructiveHint is False
+            assert draft.annotations.idempotentHint is False
+            assert draft.annotations.openWorldHint is True
+            too_long_draft = await session.call_tool('create_draft', {
+                'to': ['person@example.com'], 'subject': 'test', 'body': 'x' * 100001})
+            assert too_long_draft.isError, 'Unbounded draft body was accepted'
             print('PASS: create_draft is registered only with APPLE_MAIL_ALLOW_DRAFTS=1')
         if '--live' not in sys.argv:
             return
