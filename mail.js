@@ -10,12 +10,21 @@ function addressOf(s) {
     const m = /<([^<>]+)>\s*$/.exec(s);
     return (m ? m[1] : s).trim().toLowerCase();
 }
+let currentAccount = null;
 function account(id) {
     const matches = mail.accounts().filter(a => a.id() === id);
     if (matches.length !== 1) throw Error('Account not found; use list_accounts.');
     if (!permitted(matches[0])) throw Error('Account not permitted by APPLE_MAIL_ACCOUNTS.');
     meta.account = matches[0].emailAddresses()[0] || null;
+    currentAccount = matches[0];
     return matches[0];
+}
+// search_messages addresses mailboxes by path. An inbox or role mailbox found another way
+// is reported as a path only when it sits at the account's top level (true for every
+// account measured); otherwise null, and the caller uses list_mailboxes.
+function topLevelPath(box) {
+    const name = box.name();
+    return currentAccount.mailboxes().filter(b => b.name() === name).length === 1 ? [name] : null;
 }
 function mailbox() {
     let parent = account(p.account_id);
@@ -24,6 +33,19 @@ function mailbox() {
         const inboxes = parent.mailboxes().filter(b => b.name().toLowerCase() === 'inbox');
         if (inboxes.length !== 1) throw Error('Inbox not found or ambiguous; use list_mailboxes.');
         return inboxes[0];
+    }
+    if (p.role) {
+        // Sent and Drafts are named differently per provider ('Sent Items', 'Sent Mail',
+        // 'Sent Messages'). Mail's unified special mailbox has one child per account, so
+        // match by account instead of guessing names. Mailbox metadata only, no messages.
+        const unified = p.role === 'sent' ? mail.sentMailbox() : p.role === 'drafts' ? mail.draftsMailbox() : null;
+        if (!unified) throw Error('Unknown mailbox role.');
+        const id = parent.id();
+        const owned = unified.mailboxes().filter(b => {
+            try { return b.account().id() === id; } catch (e) { return false; }
+        });
+        if (owned.length !== 1) throw Error('No single ' + p.role + ' mailbox for this account; use list_mailboxes.');
+        return owned[0];
     }
     for (const name of p.mailbox_path) {
         const found = parent.mailboxes().filter(b => b.name() === name);
@@ -60,7 +82,7 @@ function execute() {
         // so a 200-message scan exceeded the timeout); byId is ~8 ms/property.
         const box = mailbox(), ids = box.messages.id(), total = ids.length;
         const end = Math.min(total, p.offset + p.scan_limit), results = [];
-        const query = p.query.toLowerCase();
+        const query = (p.query || '').toLowerCase();
         const recipient = p.recipient ? p.recipient.toLowerCase() : '';
         let i = p.offset, tried = 0, unreadable = 0, lastError = '';
         for (; i < end && results.length < p.limit; i++) {
@@ -73,12 +95,23 @@ function execute() {
             try {
                 const m = box.messages.byId(ids[i]);
                 if (p.unread_only && m.readStatus()) continue;
-                if (query && !(m.subject() + '\n' + m.sender()).toLowerCase().includes(query)) continue;
-                const received = m.dateReceived().toISOString();
-                if (p.since && received < p.since) continue;
-                if (p.until && received > p.until) continue;
+                // Bounds arrive as normalized UTC ISO strings (server.py), so string order is
+                // chronological. dateReceived() is read only when a bound is set.
+                if (p.since || p.until) {
+                    const received = m.dateReceived().toISOString();
+                    if (p.since && received < p.since) continue;
+                    if (p.until && received > p.until) continue;
+                }
+                let headMatch = true;
+                if (query) {
+                    headMatch = (m.subject() + '\n' + m.sender()).toLowerCase().includes(query);
+                    if (!headMatch && !p.search_body) continue;
+                }
                 if (recipient && !m.toRecipients().concat(m.ccRecipients(), m.bccRecipients())
                     .some(r => String(r.address()).toLowerCase().includes(recipient))) continue;
+                // content() is the slowest property: read it last, and only when search_body is
+                // set and subject/sender missed, so listing mode (empty query) never pays for it.
+                if (!headMatch && !String(m.content() || '').toLowerCase().includes(query)) continue;
                 entry = summary(m);
             } catch (e) {
                 unreadable++;  // usually a message deleted since the id snapshot
@@ -88,13 +121,27 @@ function execute() {
             results.push(entry);
         }
         if (tried > 0 && unreadable === tried) throw Error('No message in the scan window could be read: ' + lastError);
+        // Say plainly when this page is not the whole answer: a client that only looks at
+        // next_offset can misread a capped scan as a complete one.
+        const stopReason = i >= total ? null
+            : results.length >= p.limit ? 'result_limit'
+            : i >= end ? 'scan_limit' : 'time_budget';
+        const reasons = [];
+        if (stopReason === 'result_limit') reasons.push('Returned ' + results.length + ' matches (the limit); more may follow. Continue with next_offset.');
+        if (stopReason === 'scan_limit') reasons.push('Scanned ' + tried + ' messages (scan_limit); ' + (total - i) + ' not scanned yet. Continue with next_offset.');
+        if (stopReason === 'time_budget') reasons.push('Time budget reached after ' + tried + ' messages; ' + (total - i) + ' not scanned yet. Continue with next_offset.');
+        if (unreadable > 0) reasons.push(unreadable + ' message(s) could not be read.');
         return {messages:results, total_in_mailbox:total, next_offset:i < total ? i : null,
-            partial:unreadable > 0, unreadable_count:unreadable,
-            partial_reason:unreadable > 0 ? 'One or more messages could not be read; continue with next_offset where available.' : null,
-            search_scope:'Subject and sender substring; optional recipient-address substring and inclusive received-date bounds; in Mail mailbox order. Continue with next_offset.',
-            applied_filters:{query_applied:Boolean(p.query), unread_only:p.unread_only,
-                since:p.since, until:p.until, recipient_filter_applied:Boolean(p.recipient)},
-            ...(p.inbox ? {mailbox_path:[box.name()]} : {})};
+            scanned:tried, stop_reason:stopReason,
+            scan_complete:p.offset === 0 && stopReason === null && unreadable === 0,
+            partial:stopReason !== null || unreadable > 0, unreadable_count:unreadable,
+            partial_reason:reasons.length ? reasons.join(' ') : null,
+            search_scope:(p.search_body ? 'Subject, sender and body' : 'Subject and sender') +
+                ' substring; optional recipient-address substring and inclusive received-date bounds; in Mail mailbox order. Continue with next_offset.',
+            applied_filters:{query_applied:Boolean(p.query), search_body:Boolean(p.search_body),
+                unread_only:p.unread_only, since:p.since, until:p.until,
+                recipient_filter_applied:Boolean(p.recipient)},
+            ...(p.inbox || p.role ? {mailbox_path:topLevelPath(box)} : {})};
     }
     if (p.op === 'read') {
         const matches = mailbox().messages.whose({id:p.message_id})();
@@ -102,12 +149,30 @@ function execute() {
         const m = matches[0], result = summary(m), body = m.content();
         result.content = body.slice(0, p.max_chars);
         result.content_truncated = body.length > p.max_chars;
-        const recipients = m.toRecipients(), recipientCount = recipients.length;
-        result.to = recipients.slice(0, 100).map(r => ({
-            name:String(r.name() || '').slice(0, 500),
-            address:String(r.address() || '').slice(0, 320)}));
-        result.to_total = recipientCount;
-        result.to_truncated = recipientCount > 100;
+        // Bcc is only known for messages sent from this Mac's accounts. A list Mail cannot
+        // read is reported as unavailable instead of failing the whole read.
+        const lists = [['to', () => m.toRecipients()], ['cc', () => m.ccRecipients()],
+            ['bcc', () => m.bccRecipients()]];
+        for (const [field, read] of lists) {
+            let recipients;
+            try {
+                recipients = read();
+            } catch (e) {
+                result[field] = null;
+                result[field + '_unavailable'] = true;
+                continue;
+            }
+            result[field] = recipients.slice(0, 100).map(r => ({
+                name:String(r.name() || '').slice(0, 500),
+                address:String(r.address() || '').slice(0, 320)}));
+            result[field + '_total'] = recipients.length;
+            result[field + '_truncated'] = recipients.length > 100;
+        }
+        try {
+            result.date_sent = m.dateSent().toISOString();
+        } catch (e) {
+            result.date_sent = null;
+        }
         return result;
     }
     if (p.op === 'thread') {
@@ -328,6 +393,8 @@ function execute() {
         const draft = mail.OutgoingMessage(props);
         mail.outgoingMessages.push(draft);
         for (const address of p.to) draft.toRecipients.push(mail.ToRecipient({address:address}));
+        for (const address of p.cc || []) draft.ccRecipients.push(mail.CcRecipient({address:address}));
+        for (const address of p.bcc || []) draft.bccRecipients.push(mail.BccRecipient({address:address}));
         mail.save(draft);
         return {id:draft.id(), status:'draft', sent:false};
     }

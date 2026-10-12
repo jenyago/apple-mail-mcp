@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # The suite mocks osascript, so it runs off macOS; live Mail checks stay local
+    # (check_connection.py --live).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run python -m unittest -v
+      # Protocol and input validation only; without --live it never calls Mail.
+      - run: uv run python check_connection.py

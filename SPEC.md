@@ -1,10 +1,10 @@
 # Apple Mail MCP specification
 
-Version: 0.2.0
+Version: 0.3.0
 
-Status: implemented locally; v0.2.0 live Mail checks were not run in this implementation environment
+Status: implemented locally; read access (including Cc/Bcc), account allowlist, cross-account inbox/sent/drafts search, body/date-range search, partial-result reporting, and (one-off, not automated) draft creation verified live; the v0.2.0 thread, statistics and attachment tools and draft Cc/Bcc were not checked live
 
-Verification date: 2026-09-28
+Verification date: 2026-10-12
 
 ## Purpose
 
@@ -16,14 +16,16 @@ OAuth credentials, or a hosted service.
 ## Scope
 
 Implemented: account discovery, recursive account mailbox discovery, bounded
-subject/sender search in one mailbox with recipient/date filters, first-page inbox
-search across every permitted account, message reading, RFC-header-linked same-mailbox
-thread summaries, per-mailbox statistics, attachment metadata discovery, and (opt-in)
-visible saved draft creation.
+subject/sender/(optional body) search in one mailbox with recipient/date filters,
+first-page search of every permitted account's inbox, sent or drafts mailbox with the same
+body/date filters, message reading with To/Cc/Bcc, RFC-header-linked same-mailbox thread
+summaries, per-mailbox statistics, attachment metadata discovery, and (opt-in) visible
+saved draft creation with Cc/Bcc.
 Cross-cutting: an account allowlist, read-only-by-default operation, and an audit log.
 
 Excluded from this version: sending, deleting, archiving, moving, marking read,
-attachment byte retrieval, body/semantic search, search across unselected mailboxes,
+attachment byte retrieval, semantic search, cross-account search of mailboxes other
+than inbox, sent and drafts,
 one cursor that pages through several accounts, local “On My Mac” mailboxes,
 draft editing, and notifications. No arbitrary script execution tool is exposed.
 
@@ -58,12 +60,15 @@ under its default account when sender is empty. `python server.py --list-account
 prints every account for setup and is not an MCP tool.
 
 Each bridge call appends one JSON line (directory `0700`, file `0600`), so `search_inboxes`
-writes one line for the account listing and one per account searched (its mailbox is
-recorded as `inbox`): timestamp, operation,
+writes one line for the account listing and one per account actually searched (its mailbox is
+recorded as `inbox`; an account listed in `not_reached` was never called and so has no
+line): timestamp, operation,
 account ID, permitted account address, mailbox path, message ID, result count, and
 outcome (`ok`, or `timeout`, `automation_denied`, `blocked_by_allowlist`, `failed`).
 Subjects, senders, bodies, search text, and draft content are never logged. A log write
 failure is reported on stderr and does not fail the tool call.
+`mailbox` prefers `inbox` over an explicit mailbox path when both are present in a call
+(no current caller sets both), matching the bridge's own mailbox-resolution precedence.
 
 ## Tool contracts
 
@@ -93,8 +98,9 @@ Recursively enumerates account mailboxes. A traversal beyond 30 levels fails.
 | --- | --- | --- | --- |
 | account_id | string | required | Existing account ID |
 | mailbox_path | string[] | required | 1–30 path elements |
-| query | string | empty | Case-insensitive subject/sender substring; at most 1,000 characters |
+| query | string | empty | Case-insensitive subject/sender (with `search_body`, also content) substring; at most 1,000 characters |
 | unread_only | boolean | false | Include only unread messages if true |
+| search_body | boolean | false | Also match each candidate message's full content |
 | limit | integer | 20 | 1–100 returned matches |
 | offset | integer | 0 | At least 0 |
 | scan_limit | integer | 200 | 1–1,000 messages examined |
@@ -103,8 +109,18 @@ Recursively enumerates account mailboxes. A traversal beyond 30 levels fails.
 | recipient | string or null | null | Case-insensitive substring of To/Cc/Bcc addresses |
 
 Output: `{messages: MessageSummary[], total_in_mailbox: integer,
-next_offset: integer | null, partial: boolean, unreadable_count: integer,
+next_offset: integer | null, scanned: integer, stop_reason: string | null,
+scan_complete: boolean, partial: boolean, unreadable_count: integer,
 partial_reason: string | null, search_scope: string, applied_filters: object}`.
+
+Every page states whether it is the whole answer. `scanned` counts the messages examined
+in this call. `stop_reason` is null when the scan reached the end of the mailbox, otherwise
+`result_limit` (the page filled up; more matches may follow), `scan_limit` or
+`time_budget`. `partial` is true when `stop_reason` is set or a message could not be read,
+and `partial_reason` then says so in plain language, including how many messages are not
+scanned yet. `scan_complete` is true only when this one call covered the whole mailbox
+(offset 0, no stop, nothing unreadable). Before 0.3.0, `partial` reported only unreadable
+messages, so a capped scan could look complete to a client that ignored `next_offset`.
 
 `MessageSummary` contains `id`, `subject`, `sender`, `date_received` (ISO date
 string), and `read` (boolean). Subject and sender are capped at 1,000 characters,
@@ -122,6 +138,12 @@ bounds round down). Malformed dates, naive date-times, and inverted ranges fail 
 Mail is called. The result describes which filters were active and returns normalized
 date bounds. Recipient matching examines To, Cc, and Bcc addresses, not display names or
 message bodies.
+
+`search_body` reads a candidate message's content only when `query` is set and the
+subject/sender did not already match, and only after the cheaper date and recipient
+filters have passed; content is markedly slower per message than subject/sender alone.
+A plain listing (empty `query`) never reads content. `dateReceived()` is read only when
+a bound is set, so a plain subject/sender search pays no extra per-message cost for it.
 
 Implementation note: the bridge takes all message IDs in one call, then reads
 properties by ID. Positional access (`messages[i]`) costs time proportional to the
@@ -202,32 +224,59 @@ client can review all accounts in one call (for example `unread_only: true`).
 
 | Argument | Type | Default | Constraint |
 | --- | --- | --- | --- |
-| query | string | empty | Case-insensitive subject/sender substring; at most 1,000 characters |
+| query | string | empty | Case-insensitive subject/sender (with `search_body`, also content) substring; at most 1,000 characters |
 | unread_only | boolean | false | Include only unread messages if true |
+| search_body | boolean | false | Also match each candidate message's full content |
+| since | string or null | null | Inclusive ISO-8601 date or timezone-aware datetime |
+| until | string or null | null | Inclusive ISO-8601 date or timezone-aware datetime |
 | limit_per_account | integer | 5 | 1–50 returned matches per account |
 | scan_limit | integer | 100 | 1–1,000 messages examined per account |
 
-Output: `{accounts: AccountPage[], not_reached: {account_id, email}[], search_scope: string}`.
+Output: `{mailbox: "inbox", accounts: AccountPage[], not_reached: {account_id, email}[], search_scope: string}`.
 `AccountPage` is `{account_id, email}` plus either the single-account search fields
-(`messages`, `total_in_mailbox`, `next_offset`) and `mailbox_path`, or `error: string`.
+(`messages`, `total_in_mailbox`, `next_offset`, `scanned`, `stop_reason`, `scan_complete`,
+`partial`, `partial_reason`, …) and `mailbox_path`, or `error: string`.
+`search_inboxes` is `search_all_accounts` with `mailbox: "inbox"`, kept for existing clients.
 
 - The inbox is the account's top-level mailbox named `inbox`, matched case-insensitively
   (`INBOX` on most providers, `Inbox` on some). Zero or several matches is that account's `error`.
 - The accounts come from the same allowlist-filtered listing as `list_accounts`.
 - Each account is searched in its own bridge call, in listing order, from offset 0. A failing
-  account (timeout, missing inbox) is reported in its own entry and does not stop the others.
+  account (timeout, missing inbox, or a malformed bridge response) is reported in its own entry
+  and does not stop the others.
 - Overall budget 40 s (`SEARCH_ALL_BUDGET_MS`). Each search gets an equal share of the time
   left, capped at the single-account budget of 30 s; its scan stops there and reports
   `next_offset`. An account not started before the budget is spent is listed in `not_reached`.
+  The per-account subprocess's own hard timeout is tied to that share (plus a fixed startup
+  buffer for the bridge's `id()` listing), not a flat 45 s: a straggler budgeted a small share
+  cannot still run to the full single-account bridge timeout.
 - The budget sits below Codex's documented 60 s default tool timeout (`tool_timeout_sec`).
   Claude Code's default is about 28 hours (`MCP_TOOL_TIMEOUT`); Claude Desktop's is
   undocumented, so a call over 60 s is unverified there. A search that hangs after the budget
-  check can still run to the 45 s bridge timeout, so the hard upper bound is about 85 s. The
-  worst case measured on 2026-09-26 was 39 s.
+  check can still run close to its own share's subprocess timeout, so the hard upper bound
+  (the very first account claiming nearly the whole 40 s budget, then still overrunning it)
+  is about 85 s. The worst case measured on 2026-09-26 was 39 s.
 - No cross-account cursor: to go deeper in one account, call `search_messages` with that
   entry's `account_id`, `mailbox_path` and `next_offset`.
 - Message order is Mail's native order. On the 11 accounts measured on 2026-09-26 it was
   newest-first on all of them; that remains a property of Mail, not a guarantee of this server.
+
+### search_all_accounts
+
+The `search_inboxes` behavior above, for one mailbox role of every permitted account:
+`mailbox` is `inbox` (default), `sent` or `drafts`; every other argument and the output
+are the same, with `mailbox` echoed in the output.
+
+- Sent and Drafts are found through Mail's unified special mailboxes (`sent mailbox`,
+  `drafts mailbox`), whose children are matched to the account by account ID. Providers
+  name these folders differently (`Sent Items` on Exchange, `Sent Mail` on Gmail, `Sent
+  Messages` on iCloud); no name is guessed. Only mailbox metadata is read to find them.
+  Zero or several matches for an account is that account's `error`.
+- `mailbox_path` is returned when the found mailbox sits at the account's top level, so
+  `search_messages` can continue from `next_offset`; otherwise it is null and the client
+  uses `list_mailboxes`. All 11 accounts measured on 2026-10-12 had top-level Sent and
+  Drafts mailboxes.
+- The audit record's mailbox is the role (`sent`, `drafts`), never a folder name.
 
 ### read_message
 
@@ -238,14 +287,17 @@ each at most 255 characters), and
 Optional: `max_chars: integer`, default 20,000, range 1–100,000.
 
 Output: `MessageSummary` plus `content: string`, `content_truncated: boolean`,
-and `to: {name: string, address: string}[]`.
+`to`, `cc` and `bcc` (each `{name: string, address: string}[]`), and
+`date_sent: string | null`.
 
 Message lookup is scoped to the supplied account and mailbox. The content
 limit applies to the returned body, after Mail supplies its content. JXA uses
 JavaScript string slicing, so the limit counts UTF-16 code units, not graphemes.
-The server does not explicitly change read status. At most 100 To recipients are
-returned, with `to_total` and `to_truncated` describing any cap; each name and address
-is capped at 500 and 320 characters.
+The server does not explicitly change read status. At most 100 recipients per list are
+returned, with `<list>_total` and `<list>_truncated` describing any cap; each name and
+address is capped at 500 and 320 characters. A list Mail cannot read is `null` with
+`<list>_unavailable: true` instead of failing the whole read. Bcc is only known for
+messages sent from this Mac's accounts.
 
 ### create_draft
 
@@ -254,12 +306,13 @@ Registered only when `APPLE_MAIL_ALLOW_DRAFTS=1`. When `APPLE_MAIL_ACCOUNTS` is 
 
 Required: `to: string[]` (1–100 addresses, each 3–320 characters), `subject: string` (at most 998
 characters), `body: string` (at most 100,000 characters).
-Optional: `sender: string` (at most 320 characters), default empty (Mail's default sender).
+Optional: `sender: string` (at most 320 characters), default empty (Mail's default sender);
+`cc: string[]` and `bcc: string[]` (each at most 100 addresses), default none.
 
 Output: `{id: integer, status: "draft", sent: false}`.
 
-Creates an outgoing message, makes its compose window visible, adds recipients,
-and saves it in Mail. No send command is issued. Recipients and a nonempty
+Creates an outgoing message, makes its compose window visible, adds To, Cc and Bcc
+recipients, and saves it in Mail. No send command is issued. Recipients and a nonempty
 sender must contain `@` and must not contain CR/LF characters. This is basic
 validation, not a full email address parser. Sender should come from a listed
 account; membership is not enforced by the server.
@@ -314,14 +367,24 @@ draft; inspect Mail before retrying. Drafts may sync to the mail provider.
 | Worst-case search (unread-only, no-match query, 1,000-message scan) completes within the bridge timeout on every INBOX | Passed: `check_connection.py --live`. Measured 2026-09-25 on 11 accounts, largest inbox 11,596 messages: default scan 4-6 s, worst case 16-27 s |
 | An exhausted time budget still advances `next_offset` | Passed: one-off live probe with a zero budget (not automated) |
 | Isolated client session exposes only this server's tools | Passed: one-off headless `claude --restricted --strict-mcp-config --tools ""` tool listing (not automated) |
-| `search_inboxes` searches each permitted account's inbox in its own call; a failing account does not stop the rest; the allowlist is applied to the listing and every search; an exhausted budget lists the remaining accounts in `not_reached`; the audit log has one content-free line per account | Passed: unit tests (`SearchInboxesTests`) |
+| `search_inboxes` searches each permitted account's inbox in its own call; a failing account (including a malformed bridge response, not just a RuntimeError) does not stop the rest; the allowlist is applied to the listing and every search; an exhausted budget lists the remaining accounts in `not_reached`; the audit log has one content-free line per account actually searched | Passed: unit tests (`SearchInboxesTests`) |
 | `search_inboxes` finds every account's inbox, including a differently cased `Inbox` | Passed: `check_connection.py --live` and a headline call (`unread_only`, defaults) on 2026-09-26: 11 of 11 accounts, 0 not reached, 10 s |
 | `search_inboxes` worst case (unread-only, no-match query, 1,000-message scan, 50 per account) reaches every account with no error, though the shared budget can end a large account's scan before 1,000 messages (`next_offset` non-null) | Passed: `check_connection.py --live` and a live client run (isolated session) 2026-09-26/27. 11 of 11 accounts, 0 not reached, 0 errors, 39 s of the 40 s budget; only the 3 smallest inboxes (100-279 messages) finished their scan, the other 8 stopped at 124-197 of up to 1,000 messages checked |
-| `search_inboxes` never reaches an account outside the allowlist | Passed: `check_connection.py --live` |
+| `search_inboxes` never reaches an account outside the allowlist, and an allowlisted account under budget pressure can legitimately land in `not_reached` without that counting as a leak | Passed: `check_connection.py --live` |
+| A per-account subprocess's hard timeout scales with its computed time share instead of a flat 45 s | Passed: unit test (`test_subprocess_timeout_scales_with_the_computed_share_not_a_flat_45s`) |
+| `search_body` matches message content and `since`/`until` filter on `date_received`, on both `search_messages` and `search_inboxes`; an invalid date bound is rejected before Mail is invoked | Passed: unit tests; `check_connection.py --live` (2026-09-28, before the v0.2.0 date semantics: a bare `until` date now covers the whole day) |
 | Search date bounds validate before Mail; recipient/date filters preserve existing query semantics | Passed: unit tests |
 | Thread defaults to summaries and reports RFC-header method and partial/continuation offsets | Passed: unit tests; live JXA thread behavior unverified |
 | Statistics are per mailbox, bounded, and never present partial date counts as exact | Passed: unit tests; live counts unverified |
 | Attachment listing is bounded metadata only; no download or filesystem path operation is exposed | Passed: unit tests; byte retrieval intentionally deferred |
+| A bare `until` date includes that whole day | Passed live 2026-10-12: `since`=`until`=`2026-10-05` on a 232-message Sent Items returned the day's 5 messages with `scan_complete: true` (the pre-0.2.0 branch returned none of them) |
+| A search page reports `scanned`, `stop_reason` and `partial`, and each stop reason is reachable | Passed: unit tests (`BridgeContractTests`); live 2026-10-12 on a 232-message mailbox: `limit=1` → `result_limit`, `scan_limit=3` → `scan_limit`, `time_budget_ms=0` → `time_budget`, full scan → `stop_reason: null`, `scan_complete: true` |
+| `search_body` finds text that appears only in the body, reading content last | Passed: unit tests; live 2026-10-12 (a sent message matched on a body-only phrase) |
+| `search_all_accounts` finds every account's Sent and Drafts mailbox by role, with no folder-name guessing | Passed: unit tests (`SearchAllAccountsTests`); live 2026-10-12: 11 of 11 accounts for `sent` (18 s) and `drafts` (12 s), 0 errors, 0 not reached, `Sent Items`/`Sent Mail`/`Sent Messages` all resolved with top-level `mailbox_path` |
+| `read_message` returns Cc, Bcc and `date_sent`; an unreadable list degrades on its own | Passed: unit tests; live 2026-10-12: a sent message returned its 3 Cc recipients, `bcc_total: 0` and `date_sent` |
+| `create_draft` validates and passes Cc/Bcc | Passed: unit tests; live draft creation with Cc/Bcc not run (it would create a visible draft) |
+| The unit suite runs off macOS (osascript is always mocked) | Passed locally with the platform guard reporting Linux; CI workflow `.github/workflows/tests.yml` (unit suite plus `check_connection.py` without `--live`) on ubuntu-latest, not yet run on GitHub |
+| `check_connection.py` lists the nine read-only tools and rejects an unsupported `search_all_accounts` mailbox role; `--live` also covers `sent` and `drafts` across every account | Passed locally without `--live` (2026-10-12); the new `--live` block was not run (its calls match the live checks above) |
 
 Live checks omitted account details and email content from their output. No
 email was sent. Existing tests do not establish pagination under concurrent
@@ -351,3 +414,37 @@ session to load newly registered tools.
    destination design for traversal, symlinks, collisions, overwrite prevention,
    per-file/aggregate byte caps, and untrusted content.
 3. Consider local mailbox support and draft updates as separately scoped extensions.
+4. Automate the one-off live draft test (a designated test recipient, verify the
+   saved draft, remove it) if a safe cleanup path can be found; Mail's move to Trash
+   leaves a copy that needs purging.
+5. Add automated JXA behavior tests for pagination, nested paths, and draft
+   partial failures.
+6. `search_inboxes` still spawns one `/usr/bin/osascript` subprocess per account
+   (12 processes for 11 accounts) instead of one JXA call that loops over accounts
+   internally. Measured 2026-09-28: process spawn + JXA init is on the order of a
+   few hundred ms per account, so batching would save roughly 3-6 s of the 40 s
+   budget — real, but a minor share of it (see item 7 for where the time actually
+   goes). Deferred: it touches the audit-log write path (currently one `call_mail`
+   call writes one audit line; a batched call would need to write N), the payoff is
+   small, and this is a tool that drives real Mail data across 11 live accounts, so
+   it deserves its own dedicated review rather than being bundled into an unrelated
+   feature/fix pass. Explicitly declined 2026-09-28 given the small measured payoff.
+7. **Do not push predicates into Mail via `whose()`, and do not bulk-fetch a
+   mailbox's property columns (`box.messages.subject()`, `.dateReceived()`, etc.),
+   as a way to speed up `search_inboxes` or `search_messages` without first testing
+   against a small mailbox and watching Mail's CPU.** Tested live 2026-09-28 against
+   an 11,909-message Gmail INBOX:
+   `box.messages.whose({subject:{_contains:'zz-no-such-subject-zz'}}).id()` did not
+   return within 90 s and, after the subprocess was killed, left Mail.app pinned at
+   100% CPU for several minutes afterward — even a trivial follow-up `id()` call
+   (normally ~1.7 s on this inbox) then also timed out. This is a much more severe,
+   empirically confirmed version of the "a timed-out call does not cancel work
+   already queued in Mail" caveat under Runtime and architecture above: one hung
+   `whose()` call did not just fail, it degraded every subsequent call against that
+   Mail instance. Given `search_inboxes` already runs under a tight shared time
+   budget across every account, a single such hang would be far worse than the
+   current per-message `byId()` scan, which is the verified-safe access pattern
+   (see the implementation note under `search_messages` above). No bulk-column-fetch
+   variant was tested (ruled out for the same reason before it could run) — if this
+   is revisited, test against a small inbox (dozens of messages) first, and watch
+   `ps -o pcpu -p <Mail PID>` during and after, before trying it against a large one.

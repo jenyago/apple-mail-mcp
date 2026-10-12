@@ -11,12 +11,19 @@ scripting dictionary. No email credentials or remote server required.
 - `list_accounts`: permitted account IDs, names, and email addresses.
 - `list_mailboxes`: nested mailbox paths for an account.
 - `search_messages`: paginated, case-insensitive subject/sender search in a mailbox.
-  Optional inclusive `since`/`until` ISO-8601 bounds and a case-insensitive recipient
-  address substring narrow the same search.
-- `search_inboxes`: first-page subject/sender search in the inbox of every permitted account in one call
-  (first page from each; `unread_only: true` reviews what is new). Go deeper in one account
-  with `search_messages` and the `next_offset` it returns.
-- `read_message`: message metadata and bounded plain-text content.
+  Optional `search_body` (also matches content, slower per message), inclusive
+  `since`/`until` ISO-8601 bounds and a case-insensitive recipient address substring
+  narrow the same search.
+- `search_inboxes`: the same search (including `search_body`, `since`, `until`) over the
+  inbox of every permitted account in one call (first page from each; `unread_only: true`
+  reviews what is new). Go deeper in one account with `search_messages` and the
+  `next_offset` it returns.
+- `search_all_accounts`: the same cross-account search over each account's `inbox`,
+  `sent` or `drafts` mailbox, for questions like "what did I send since Monday" or "what
+  is still in Drafts". Sent and Drafts are found through Mail's own special mailboxes, so
+  provider-specific names (`Sent Items`, `Sent Mail`, `Sent Messages`) need no guessing.
+- `read_message`: message metadata, To/Cc/Bcc recipients, date sent, and bounded
+  plain-text content. Bcc is only known for messages sent from this Mac's accounts.
 - `get_thread`: same-mailbox messages linked by RFC `Message-ID`, `References`, and
   `In-Reply-To`; summaries by default, with bounded optional bodies. Mail exposes no native
   conversation-membership property through JXA, so results identify the method and whether
@@ -30,12 +37,15 @@ scripting dictionary. No email credentials or remote server required.
   otherwise the count is unavailable with a reason. No implicit all-account aggregation.
 - `list_attachments`: paginated attachment metadata (name, MIME type, approximate size,
   downloaded state) for one message. Attachment bytes are **not** retrieved or written.
-- `create_draft`: save a visible draft for review in Mail; never sends it.
-  **Off by default** — see Configuration.
+- `create_draft`: save a visible draft (To, optional Cc/Bcc) for review in Mail; never
+  sends it. **Off by default** — see Configuration.
 
 Use account IDs and mailbox path arrays returned by the listing tools. Search
 scans at most 200 messages by default (up to 1,000), in Mail's native order, and
-stops after about 30 seconds on a slow mailbox. Follow
+stops after about 30 seconds on a slow mailbox. Every search page says whether it is the
+whole answer: `partial: true` with a `stop_reason` (`result_limit`, `scan_limit` or
+`time_budget`) and a plain-language `partial_reason` means it is not, and `scanned`
+counts the messages examined. Follow
 `next_offset` until null, including on empty pages. Results are not guaranteed
 newest-first. Mailbox changes between pages can cause skips or duplicates.
 Account-scoped mailboxes only; local “On My Mac” mailboxes and attachment downloads
@@ -77,8 +87,8 @@ attachment bytes, search filters, or file paths. Blocked attempts are logged wit
 `blocked_by_allowlist`. It also never contains subjects, senders, message bodies, or
 draft content.
 
-Draft inputs are limited to 100 recipients, a 998-character subject, a 100,000-character
-body, and a 320-character sender value.
+Draft inputs are limited to 100 To, 100 Cc and 100 Bcc recipients, a 998-character
+subject, a 100,000-character body, and a 320-character sender value.
 
 ## Security model
 
@@ -132,6 +142,18 @@ codex mcp add apple-mail -- "$PWD/.venv/bin/python" "$PWD/server.py"
 Set `APPLE_MAIL_ACCOUNTS` in the server's environment as Codex's MCP configuration
 allows (not verified here).
 
+### Grok Build
+
+xAI's terminal agent runs local stdio servers. From the cloned directory:
+
+```sh
+grok mcp add apple-mail -e APPLE_MAIL_ACCOUNTS=you@example.com -- "$PWD/.venv/bin/python" "$PWD/server.py"
+```
+
+Not verified here. Mail you read is sent to xAI, and a Grok configuration that
+auto-approves tool calls removes the prompt before each call. grok.com and the xAI API
+accept only remote (HTTP) MCP servers, which this local server deliberately is not.
+
 ### Claude Desktop
 
 Merge this entry into `~/Library/Application Support/Claude/claude_desktop_config.json`,
@@ -169,7 +191,8 @@ uv run python check_connection.py --live
 
 The live check lists accounts without printing their contents, then proves against real
 Mail that an allowlist filters `list_accounts`, blocks other accounts, and is logged, and
-that `search_inboxes` reaches every permitted account inside its time budget.
+that `search_inboxes` reaches every permitted account inside its time budget, and that
+`search_all_accounts` finds every account's Sent and Drafts mailbox.
 It does not create drafts or send email. Unit tests cover script injection resistance,
 permission errors, timeouts, recipient validation, allowlist parsing and fail-closed
 behavior, draft gating, and that the audit log never contains message content. Protocol
